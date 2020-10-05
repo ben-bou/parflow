@@ -46,6 +46,7 @@
 #endif
 #endif
 
+#include <stdbool.h>
 #include <stdio.h>
 #include <sys/times.h>
 
@@ -322,27 +323,6 @@ typedef struct amps_buffer {
 /* Invoices plus the src or dest rank.                                       */
 /*===========================================================================*/
 
-
-#ifdef AMPS_MPI_NOT_USE_PERSISTENT
-
-typedef struct {
-  int num_send;
-  int           *dest;
-  amps_Invoice  *send_invoices;
-
-  int num_recv;
-  int           *src;
-  amps_Invoice  *recv_invoices;
-
-  MPI_Request   *requests;
-
-  int recv_remaining;
-} amps_PackageStruct;
-
-typedef amps_PackageStruct *amps_Package;
-
-#else
-
 typedef struct {
   int num_send;
   int           *dest;
@@ -360,9 +340,6 @@ typedef struct {
 } amps_PackageStruct;
 
 typedef amps_PackageStruct *amps_Package;
-
-#endif
-
 
 typedef struct _amps_HandleObject {
   int type;
@@ -383,6 +360,11 @@ extern amps_Buffer *amps_BufferFreeList;
  *   PACKING structures and defines
  *
  *****************************************************************************/
+
+#define AMPS_GETRBUF 1
+#define AMPS_GETSBUF 2
+#define AMPS_PACK 4
+#define AMPS_UNPACK 8
 
 #define AMPS_PACKED 2
 
@@ -1042,7 +1024,6 @@ void amps_ReadDouble(amps_File file, double *ptr, int len);
  * @param ptr Pointer to dataspace to free
  * @return Error code
  */
-
 #define amps_TFree(ptr) if (ptr) free(ptr); else {}
 /* note: the `else' is required to guarantee termination of the `if' */
 
@@ -1050,10 +1031,223 @@ void amps_ReadDouble(amps_File file, double *ptr, int len);
 #define amps_Error(name, type, comment, operation) \
   printf("%s : %s\n", name, comment)
 
+#ifdef PARFLOW_HAVE_CUDA
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+/* Do not use persistent communication with CUDA */
+#define AMPS_MPI_NOT_USE_PERSISTENT
+
+/*--------------------------------------------------------------------------
+ * Amps gpu structs for global amps variables
+ *--------------------------------------------------------------------------*/
+typedef struct _amps_GpuBuffer {
+  char **buf;
+  char **buf_host;
+  int *buf_size;
+  int num_bufs;
+} amps_GpuBuffer;
+
+#define AMPS_GPU_MAX_STREAMS 10
+typedef struct _amps_GpuStreams {
+  cudaStream_t *stream;
+  int num_streams;
+} amps_GpuStreams;
+
+/*--------------------------------------------------------------------------
+ *  GPU error handling macros
+ *--------------------------------------------------------------------------*/
+
+/**
+ * @brief CUDA error handling.
+ * 
+ * If error detected, print error message and exit.
+ *
+ * @param expr CUDA error (of type cudaError_t) [IN]
+ */
+#define CUDA_ERRCHK( err ) (amps_cuda_error( err, __FILE__, __LINE__ ))
+static inline void amps_cuda_error(cudaError_t err, const char *file, int line) {
+	if (err != cudaSuccess) {
+		printf("\n\n%s in %s at line %d\n", cudaGetErrorString(err), file, line);
+		exit(1);
+	}
+}
+
+#ifdef PARFLOW_HAVE_RMM
+#include <rmm/rmm_api.h>
+/**
+ * @brief RMM error handling.
+ * 
+ * If error detected, print error message and exit.
+ *
+ * @param expr RMM error (of type rmmError_t) [IN]
+ */
+#define RMM_ERRCHK( err ) (amps_rmm_error( err, __FILE__, __LINE__ ))
+static inline void amps_rmm_error(rmmError_t err, const char *file, int line) {
+	if (err != RMM_SUCCESS) {
+		printf("\n\n%s in %s at line %d\n", rmmGetErrorString(err), file, line);
+		exit(1);
+	}
+}
+#endif
+
+/*--------------------------------------------------------------------------
+ * Define static unified memory allocation routines for CUDA
+ *--------------------------------------------------------------------------*/
+
+/**
+ * @brief Allocates unified memory.
+ * 
+ * If RMM library is available, pool allocation is used for better performance.
+ * 
+ * @note Should not be called directly.
+ *
+ * @param size bytes to be allocated [IN]
+ * @return a void pointer to the allocated dataspace
+ */
+static inline void *_amps_talloc_cuda(size_t size)
+{
+  void *ptr = NULL;  
+  
+#ifdef PARFLOW_HAVE_RMM
+  RMM_ERRCHK(rmmAlloc(&ptr,size,0,__FILE__,__LINE__));
+#else
+  CUDA_ERRCHK(cudaMallocManaged((void**)&ptr, size, cudaMemAttachGlobal));
+  // CUDA_ERRCHK(cudaHostAlloc((void**)&ptr, size, cudaHostAllocMapped));  
+#endif
+  
+  return ptr;
+}
+
+/**
+ * @brief Allocates unified memory initialized to 0.
+ * 
+ * If RMM library is available, pool allocation is used for better performance.
+ * 
+ * @note Should not be called directly.
+ *
+ * @param size bytes to be allocated [IN]
+ * @return a void pointer to the allocated dataspace
+ */
+static inline void *_amps_ctalloc_cuda(size_t size)
+{
+  void *ptr = NULL;  
+
+#ifdef PARFLOW_HAVE_RMM
+  RMM_ERRCHK(rmmAlloc(&ptr,size,0,__FILE__,__LINE__));
+#else
+  CUDA_ERRCHK(cudaMallocManaged((void**)&ptr, size, cudaMemAttachGlobal));
+  // CUDA_ERRCHK(cudaHostAlloc((void**)&ptr, size, cudaHostAllocMapped));
+#endif  
+  // memset(ptr, 0, size);
+  CUDA_ERRCHK(cudaMemset(ptr, 0, size));  
+  
+  return ptr;
+}
+
+/**
+ * @brief Frees unified memory allocated with \ref _talloc_cuda or \ref _ctalloc_cuda.
+ * 
+ * @note Should not be called directly.
+ *
+ * @param ptr a void pointer to the allocated dataspace [IN]
+ */
+static inline void _amps_tfree_cuda(void *ptr)
+{
+#ifdef PARFLOW_HAVE_RMM
+  RMM_ERRCHK(rmmFree(ptr,0,__FILE__,__LINE__));
+#else
+  CUDA_ERRCHK(cudaFree(ptr));
+  // CUDA_ERRCHK(cudaFreeHost(ptr));
+#endif
+}
+
+/** Same as \ref amps_TAlloc but allocates managed memory (CUDA required) */
+#define amps_TAlloc_managed(type, count) ((count>0) ? (type*)_amps_talloc_cuda((unsigned int)(sizeof(type) * (count))) : NULL)
+
+/** Same as \ref amps_CTAlloc but allocates managed memory */
+#define amps_CTAlloc_managed(type, count) ((count) ? (type*)_amps_ctalloc_cuda((unsigned int)(sizeof(type) * (count))) : NULL)
+
+/** Same as \ref amps_TFree but deallocates managed memory */
+#define amps_TFree_managed(ptr) if (ptr) _amps_tfree_cuda(ptr); else {}
+
+/*--------------------------------------------------------------------------
+ * Define amps GPU kernels
+ *--------------------------------------------------------------------------*/
+#define BLOCKSIZE_MAX 1024
+
+#ifdef __CUDACC__
+extern "C++"{
+template <typename T>
+__global__ static void 
+__launch_bounds__(BLOCKSIZE_MAX)
+StridedCopyKernel(T * __restrict__ dest, const int stride_dest, 
+                                  T * __restrict__ src, const int stride_src, const int len) 
+{
+  const int tid = ((blockIdx.x*blockDim.x)+threadIdx.x);
+    
+  if(tid < len)
+  { 
+    const int idx_dest = tid * stride_dest;
+    const int idx_src = tid * stride_src;
+
+    dest[idx_dest] = src[idx_src];
+  }
+}
+template <typename T>
+__global__ static void 
+__launch_bounds__(BLOCKSIZE_MAX)
+PackingKernel(T * __restrict__ ptr_buf, const T * __restrict__ ptr_data, 
+    const int len_x, const int len_y, const int len_z, const int stride_x, const int stride_y, const int stride_z) 
+{
+  const int k = ((blockIdx.z*blockDim.z)+threadIdx.z);   
+  if(k < len_z)
+  {
+    const int j = ((blockIdx.y*blockDim.y)+threadIdx.y);   
+    if(j < len_y)
+    {
+      const int i = ((blockIdx.x*blockDim.x)+threadIdx.x);   
+      if(i < len_x)
+      {
+        *(ptr_buf + k * len_y * len_x + j * len_x + i) = 
+          *(ptr_data + k * (stride_z + (len_y - 1) * stride_y + len_y * (len_x - 1) * stride_x) + 
+            j * (stride_y + (len_x - 1) * stride_x) + i * stride_x);
+      }
+    }
+  }
+}
+
+template <typename T>
+__global__ static void 
+__launch_bounds__(BLOCKSIZE_MAX)
+UnpackingKernel(const T * __restrict__ ptr_buf, T * __restrict__  ptr_data, 
+    const int len_x, const int len_y, const int len_z, const int stride_x, const int stride_y, const int stride_z) 
+{
+  const int k = ((blockIdx.z*blockDim.z)+threadIdx.z);   
+  if(k < len_z)
+  {
+    const int j = ((blockIdx.y*blockDim.y)+threadIdx.y);   
+    if(j < len_y)
+    {
+      const int i = ((blockIdx.x*blockDim.x)+threadIdx.x);   
+      if(i < len_x)
+      {
+        *(ptr_data + k * (stride_z + (len_y - 1) * stride_y + len_y * (len_x - 1) * stride_x) + 
+          j * (stride_y + (len_x - 1) * stride_x) + i * stride_x) = 
+            *(ptr_buf + k * len_y * len_x + j * len_x + i);
+      }
+    }
+  }
+}
+}
+
+#endif // __CUDACC__
+
+#endif // PARFLOW_HAVE_CUDA
+
 #include "amps_proto.h"
 
 #define AMPS_EXCHANGE_SPECIALIZED 1
 #define AMPS_NEWPACKAGE_SPECIALIZED 1
 
 #endif
-

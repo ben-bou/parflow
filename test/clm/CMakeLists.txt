@@ -7,19 +7,21 @@ if(${PARFLOW_HAVE_CLM})
     list(APPEND TESTS
       clm.tcl
       clm_forc_veg.tcl
-      clm_varDZ.tcl)
+      clm_varDZ.tcl
+      clm_slope.tcl)
   endif()
 endif()
 
 set(APPEND PARALLEL_TESTS)
 
-if(${PARFLOW_AMPS_LAYER} STREQUAL "mpi1")
+if((${PARFLOW_AMPS_LAYER} STREQUAL "mpi1") OR (${PARFLOW_AMPS_LAYER} STREQUAL "cuda"))
   if(${PARFLOW_HAVE_HYPRE})
     list(APPEND PARALLEL_TESTS
       clm.tcl
       clm.jac.tcl
       clm_forc_veg.tcl
-      clm_varDZ.tcl)
+      clm_varDZ.tcl
+      clm_slope.tcl)
   endif()
 endif()
 
