@@ -87,6 +87,7 @@ set (SRC_FILES_CONST advect.F
   problem_richards_bc_internal.c
   problem_saturation_constitutive.c
   problem_spec_storage.c
+  problem_van_genuchten.c
   problem_thermal_conductivity.c
   problem_toposlope_x.c
   problem_toposlope_y.c
@@ -127,6 +128,7 @@ set (SRC_FILES_CONST advect.F
 if( (${PARFLOW_HAVE_CUDA}) OR (${PARFLOW_HAVE_OMP}) )
 
   set (SRC_FILES_ARCH_TYPE_0
+    clustering.cpp
     globals.cpp
     grgeometry.cpp
   )
@@ -154,7 +156,6 @@ if( (${PARFLOW_HAVE_CUDA}) OR (${PARFLOW_HAVE_OMP}) )
   )
   set (SRC_FILES_ARCH_TYPE_2
     calc_elevations.cpp
-    clustering.cpp
     pf_module.cpp
     problem_bc.cpp
     problem_bc_pressure.cpp
